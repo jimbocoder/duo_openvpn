@@ -16,6 +16,7 @@ import os
 import socket
 import sys
 import syslog
+import multiprocessing
 
 import six
 from six.moves import http_client
@@ -361,29 +362,48 @@ def preauth(client, control, username, ipaddr):
 def auth(client, control, username, password, ipaddr):
     log('authentication for %s' % username)
 
-    response = client.json_api_call('POST', '/rest/v1/auth', {
-        'user': username,
-        'factor': 'auto',
-        'auto': password,
-        'ipaddr': ipaddr,
-    })
+    #
+    # This is the original auth() function definition from Duo's vanilla plugin
+    #
+    def _auth():
 
-    result = response.get('result')
-    status = response.get('status')
+        response = client.json_api_call('POST', '/rest/v1/auth', {
+            'user': username,
+            'factor': 'auto',
+            'auto': password,
+            'ipaddr': ipaddr,
+        })
 
-    if not result or not status:
-        log('invalid API response: %s' % response)
-        failure(control)
+        result = response.get('result')
+        status = response.get('status')
 
-    if result == API_RESULT_ALLOW:
-        log('auth success for %s: %s' % (username, status))
-        success(control)
-    elif result == API_RESULT_DENY:
-        log('auth failure for %s: %s' % (username, status))
+        if not result or not status:
+            log('invalid API response: %s' % response)
+            failure(control)
+
+        if result == API_RESULT_ALLOW:
+            log('auth success for %s: %s' % (username, status))
+            success(control)
+        elif result == API_RESULT_DENY:
+            log('auth failure for %s: %s' % (username, status))
+            failure(control)
+        else:
+            log('unknown auth result: %s' % result)
+            failure(control)
+
+
+    # Now call the original function, but force it time out (50s) before openvpn can time out internally (60s)
+    p = multiprocessing.Process(target=_auth)
+    p.start()
+    p.join(timeout=50) # 50 is less than 60! amazing!
+    if p.exitcode is None:
+        # The process timed out, user didn't respond to the push
+        log('auth failure for %s: %s' % (username, "bwell-preemptive-timeout: Duo auth API call timed out."))
         failure(control)
     else:
-        log('unknown auth result: %s' % result)
-        failure(control)
+        # The process terminated quickly enough. Pass along its exitcode and get out
+        sys.exit(p.exitcode)
+
 
 def main(Client=Client, environ=os.environ):
     control = environ.get('control')
